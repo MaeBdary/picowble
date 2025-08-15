@@ -46,6 +46,17 @@ target_link_libraries(blink
     pico_btstack_cyw43
 )
 
+# Build BTstack's ATT DB utility (required for att_db_util.h/.c)
+target_sources(blink PRIVATE
+    ${PICO_SDK_PATH}/lib/btstack/src/ble/att_db_util.c
+)
+
+# Include paths so the header is found
+target_include_directories(blink PRIVATE
+    ${PICO_SDK_PATH}/lib/btstack/src        # for btstack_util.h and friends
+    ${PICO_SDK_PATH}/lib/btstack/src/ble    # for att_db_util.h
+)
+
 # Tells compiler where btstack_config.h is
 target_include_directories(blink PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 

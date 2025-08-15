@@ -1,231 +1,259 @@
-/**
- * Complete BLE GATT Server for Raspberry Pi Pico W
- * Matches the functionality expected by bleCommunication.py
- */
+// BLE peripheral for Raspberry Pi Pico W using att_db_util
+// - Advertises custom 128-bit service UUID (in ADV) and name "PicoBLE" (in scan response)
+// - GATT includes GAP Device Name + GATT Service Changed + custom service
+// - Notify char: 19b10001-... (READ | NOTIFY, 1-byte init value)
+// - Write  char: 19b10002-... (WRITE w/ response, DYNAMIC)
+// - Commands: "led on", "led off", "led?" ; else echo "pico says: <...>"
+// - Sends <READY> only after CCCD enables notifications
+// - Uses ATT_EVENT_CAN_SEND_NOW + a tiny queue for reliable notifies
 
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
 #include "btstack.h"
+#include "att_db_util.h"
 
-// GATT database handles - these will be set when the database is created
-static uint16_t notify_char_handle;
-static uint16_t write_char_handle;
 static hci_con_handle_t connection_handle = HCI_CON_HANDLE_INVALID;
+static btstack_packet_callback_registration_t hci_event_cb;
 
-// Command processing
-static char command_buffer[256];
-static int command_index = 0;
+static bool     led_on = false;
+static uint16_t notify_val_handle = 0;
+static uint16_t write_val_handle  = 0;
+static uint16_t notify_cccd_handle = 0;   // value_handle + 1
+static int      notify_enabled = 0;
 
-// BTstack callback registration
-static btstack_packet_callback_registration_t hci_event_callback_registration;
+// --- simple single-message queue for notifications ---
+#define MSG_MAX 128
+static char pending_msg[MSG_MAX];
+static uint16_t pending_len = 0;
 
-// Advertisement data - device name "Nano33BLE"
+static void queue_note(const char *s){
+    if (!s) return;
+    size_t n = strlen(s);
+    if (n > MSG_MAX) n = MSG_MAX;
+    memcpy(pending_msg, s, n);
+    pending_len = (uint16_t)n;
+    if (connection_handle != HCI_CON_HANDLE_INVALID){
+        att_server_request_can_send_now_event(connection_handle);
+    }
+}
+
+// UUIDs (little-endian bytes)
+static const uint8_t UUID_SVC_19B1_0000[16] = {0x14,0x12,0x8a,0x76,0x04,0xd1,0x6c,0x4f,0x7e,0x53,0xf2,0xe8,0x00,0x00,0xb1,0x19};
+static const uint8_t UUID_CHR_19B1_0001[16] = {0x14,0x12,0x8a,0x76,0x04,0xd1,0x6c,0x4f,0x7e,0x53,0xf2,0xe8,0x01,0x00,0xb1,0x19};
+static const uint8_t UUID_CHR_19B1_0002[16] = {0x14,0x12,0x8a,0x76,0x04,0xd1,0x6c,0x4f,0x7e,0x53,0xf2,0xe8,0x02,0x00,0xb1,0x19};
+
+// Advertise: flags + Complete List of 128-bit UUIDs (your service)
 static uint8_t adv_data[] = {
-    0x02, 0x01, 0x06,  // Flags
-    0x0B, 0x09, 'P', 'i', 'c', 'o', 'B', 'e', 'a', 'c', 'o', 'n' // Complete Local Name
+    0x02, 0x01, 0x06,
+    0x11, 0x07,
+    0x14,0x12,0x8a,0x76,0x04,0xd1,0x6c,0x4f,0x7e,0x53,0xf2,0xe8,0x00,0x00,0xb1,0x19
 };
 
-// GATT Database in binary format
-// This defines our custom service and characteristics
-static const uint8_t gatt_database[] = {
-    // Primary Service Declaration - GAP Service
-    0x00, 0x01, 0x02, 0x00, 0x01, 0x00, 0x00, 0x28,
-    0x00, 0x18,
-    
-    // Device Name Characteristic Declaration
-    0x00, 0x02, 0x02, 0x00, 0x02, 0x00, 0x03, 0x28,
-    0x02, 0x03, 0x00, 0x00, 0x2a,
-    
-    // Device Name Characteristic Value
-    0x00, 0x03, 0x02, 0x00, 0x02, 0x00, 0x00, 0x2a,
-    'N', 'a', 'n', 'o', '3', '3', 'B', 'L', 'E',
-    
-    // Primary Service Declaration - Custom Service
-    0x00, 0x04, 0x02, 0x00, 0x01, 0x00, 0x00, 0x28,
-    0x14, 0x12, 0x8a, 0x76, 0x04, 0xd1, 0x6c, 0x4f, 0x7e, 0x53, 0xf2, 0xe8, 0x00, 0x00, 0xb1, 0x19,
-    
-    // Notify Characteristic Declaration
-    0x00, 0x05, 0x02, 0x00, 0x02, 0x00, 0x03, 0x28,
-    0x10, 0x06, 0x00, 0x14, 0x12, 0x8a, 0x76, 0x04, 0xd1, 0x6c, 0x4f, 0x7e, 0x53, 0xf2, 0xe8, 0x01, 0x00, 0xb1, 0x19,
-    
-    // Notify Characteristic Value
-    0x00, 0x06, 0x02, 0x00, 0x10, 0x00, 0x14, 0x12, 0x8a, 0x76, 0x04, 0xd1, 0x6c, 0x4f, 0x7e, 0x53, 0xf2, 0xe8, 0x01, 0x00, 0xb1, 0x19,
-    0x00,
-    
-    // Client Characteristic Configuration Descriptor
-    0x00, 0x07, 0x02, 0x00, 0x0A, 0x00, 0x02, 0x29,
-    0x00, 0x00,
-    
-    // Write Characteristic Declaration  
-    0x00, 0x08, 0x02, 0x00, 0x02, 0x00, 0x03, 0x28,
-    0x08, 0x09, 0x00, 0x14, 0x12, 0x8a, 0x76, 0x04, 0xd1, 0x6c, 0x4f, 0x7e, 0x53, 0xf2, 0xe8, 0x02, 0x00, 0xb1, 0x19,
-    
-    // Write Characteristic Value
-    0x00, 0x09, 0x02, 0x00, 0x08, 0x00, 0x14, 0x12, 0x8a, 0x76, 0x04, 0xd1, 0x6c, 0x4f, 0x7e, 0x53, 0xf2, 0xe8, 0x02, 0x00, 0xb1, 0x19,
-    0x00,
+// Scan response: Complete Local Name "PicoBLE"
+static uint8_t scan_resp[] = {
+    0x08, 0x09, 'P','i','c','o','B','L','E'
 };
 
-// Send notification to connected client
-static void send_notification(const char* message) {
-    if (connection_handle != HCI_CON_HANDLE_INVALID && notify_char_handle) {
-        att_server_notify(connection_handle, notify_char_handle, (uint8_t*)message, strlen(message));
-        printf("Sent: %s\n", message);
-    }
+static void set_led(bool on){
+    led_on = on;
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, on ? 1 : 0);
 }
 
-// Process complete command
-static void process_command(const char* cmd) {
-    printf("Processing command: '%s'\n", cmd);
-    
-    if (strcmp(cmd, "led on") == 0) {
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-        send_notification("LED turned ON");
-        
-    } else if (strcmp(cmd, "led off") == 0) {
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-        send_notification("LED turned OFF");
-        
-    } else if (strcmp(cmd, "led?") == 0) {
-        bool led_state = cyw43_arch_gpio_get(CYW43_WL_GPIO_LED_PIN);
-        send_notification(led_state ? "LED is ON" : "LED is OFF");
-        
-    } else if (strlen(cmd) > 0) {
-        // Echo back any other command with "pico says:" prefix
-        char response[300];
-        snprintf(response, sizeof(response), "pico says: %s", cmd);
-        send_notification(response);
-    }
+static void send_led_status(void){
+    queue_note(led_on ? "LED=ON" : "LED=OFF");
 }
 
-// ATT read callback
-static uint16_t att_read_callback(hci_con_handle_t con_handle, uint16_t att_handle, 
-                                  uint16_t offset, uint8_t * buffer, uint16_t buffer_size) {
-    // Return empty data for characteristic reads
-    if (buffer_size >= 1) {
+// --- ATT callbacks ---
+static uint16_t att_read_cb(hci_con_handle_t con_handle, uint16_t att_handle, uint16_t offset,
+                            uint8_t *buffer, uint16_t buffer_size){
+    (void)con_handle; (void)att_handle; (void)offset;
+    // keep a 1-byte readable value so CoreBluetooth is happy
+    if (buffer && buffer_size){
         buffer[0] = 0x00;
         return 1;
     }
     return 0;
 }
 
-// ATT write callback - handles incoming commands
-static int att_write_callback(hci_con_handle_t con_handle, uint16_t att_handle, 
-                              uint16_t transaction_mode, uint16_t offset, uint8_t *buffer, uint16_t buffer_size) {
-    
-    if (att_handle == write_char_handle) {
-        // Process incoming data character by character
-        for (int i = 0; i < buffer_size; i++) {
-            char c = buffer[i];
-            
-            if (c == '\0' || c == '\n' || c == '\r') {
-                // End of command - process it
-                if (command_index > 0) {
-                    command_buffer[command_index] = '\0';
-                    process_command(command_buffer);
-                    command_index = 0;
-                }
-            } else if (command_index < sizeof(command_buffer) - 1) {
-                // Add character to buffer
-                command_buffer[command_index++] = c;
-            }
+// NOTE: write callback wants non-const data* per btstack typedef
+static int att_write_cb(hci_con_handle_t con_handle, uint16_t att_handle, uint16_t transaction_mode,
+                        uint16_t offset, uint8_t *data, uint16_t len){
+    (void)con_handle; (void)transaction_mode; (void)offset;
+
+    // Client toggled notifications?
+    if (att_handle == notify_cccd_handle){
+        // value is 2 bytes, bit0 = notifications enabled
+        int en = 0;
+        if (len >= 2){
+            uint16_t v = data[0] | (data[1] << 8);
+            en = (v & 0x0001) ? 1 : 0;
         }
+        notify_enabled = en;
+        if (notify_enabled){
+            queue_note("<READY>");
+        } else {
+            pending_len = 0;
+        }
+        return 0;
     }
+
+    // Command written to our write characteristic?
+    if (att_handle == write_val_handle){
+        char cmd[128];
+        if (len >= (int)sizeof(cmd)) len = sizeof(cmd)-1;
+        memcpy(cmd, data, len); cmd[len] = '\0';
+
+        // trim
+        char *p = cmd; while (*p && isspace((unsigned char)*p)) ++p;
+        size_t L = strlen(p);
+        while (L && isspace((unsigned char)p[L-1])) p[--L] = '\0';
+
+        // lowercase
+        char low[128] = {0};
+        for (size_t i=0; i<L && i<sizeof(low)-1; ++i) low[i] = (char)tolower((unsigned char)p[i]);
+
+        if (strcmp(low,"led on")==0){
+            set_led(true);  queue_note("OK");
+        } else if (strcmp(low,"led off")==0){
+            set_led(false); queue_note("OK");
+        } else if (strcmp(low,"led?")==0 || strcmp(low,"led ?")==0){
+            send_led_status();
+        } else if (strcmp(low,"test")==0){
+            queue_note("OK");
+        } else {
+            char out[MSG_MAX];
+            snprintf(out,sizeof(out),"pico says: %s", p);
+            queue_note(out);
+        }
+        return 0;
+    }
+
     return 0;
 }
 
-// Bluetooth event handler
-static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
+// --- HCI / ATT event handler ---
+static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
+    (void)channel; (void)size;
     if (packet_type != HCI_EVENT_PACKET) return;
-    
-    switch (hci_event_packet_get_type(packet)) {
+
+    switch (hci_event_packet_get_type(packet)){
         case BTSTACK_EVENT_STATE:
-            if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
-                printf("BTstack ready - starting advertising\n");
-                
-                // Set advertising data and start advertising
+            if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING){
                 gap_advertisements_set_params(0x30, 0x30, 0, 0, (bd_addr_t){0}, 0x07, 0x00);
                 gap_advertisements_set_data(sizeof(adv_data), adv_data);
+                gap_scan_response_set_data(sizeof(scan_resp), scan_resp);
                 gap_advertisements_enable(1);
-                printf("Advertising as 'Nano33BLE'\n");
+                printf("Advertising (UUID + name in scan response)\n");
             }
             break;
-            
-        case HCI_EVENT_LE_META:
-            switch (hci_event_le_meta_get_subevent_code(packet)) {
-                case HCI_SUBEVENT_LE_CONNECTION_COMPLETE:
-                    connection_handle = hci_subevent_le_connection_complete_get_connection_handle(packet);
-                    printf("Client connected (handle: %04x)\n", connection_handle);
-                    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);  // LED on when connected
-                    
-                    // Send required connection signals
-                    sleep_ms(100);
-                    send_notification("<CONNECTED>");
-                    sleep_ms(100);
-                    send_notification("<READY>");
-                    break;
+
+        case HCI_EVENT_LE_META: {
+            uint8_t sub = hci_event_le_meta_get_subevent_code(packet);
+            if (sub == HCI_SUBEVENT_LE_CONNECTION_COMPLETE){
+                connection_handle = hci_subevent_le_connection_complete_get_connection_handle(packet);
+                printf("Connected (handle %04x)\n", connection_handle);
+                gap_request_connection_parameter_update(connection_handle, 24, 40, 0, 400);
+                // Don't send any notify yet; wait for CCCD enable -> <READY>
             }
             break;
-            
+        }
+
         case HCI_EVENT_DISCONNECTION_COMPLETE:
-            printf("Client disconnected\n");
+            printf("Disconnected\n");
             connection_handle = HCI_CON_HANDLE_INVALID;
-            command_index = 0;  // Reset command buffer
-            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);  // LED off when disconnected
-            gap_advertisements_enable(1);  // Restart advertising
+            notify_enabled = 0;
+            pending_len = 0;
+            gap_advertisements_enable(1);
             break;
-            
-        case ATT_EVENT_CONNECTED:
-            printf("ATT connected\n");
+
+        case ATT_EVENT_CAN_SEND_NOW:
+            if (notify_enabled && pending_len > 0 && connection_handle != HCI_CON_HANDLE_INVALID){
+                att_server_notify(connection_handle, notify_val_handle,
+                                  (const uint8_t*)pending_msg, pending_len);
+                pending_len = 0;
+            }
             break;
-            
-        case ATT_EVENT_DISCONNECTED:
-            printf("ATT disconnected\n");
+
+        default:
             break;
     }
 }
 
-int main() {
+static void build_gatt(void){
+    att_db_util_init();
+
+    // GAP: Device Name "PicoBLE"
+    att_db_util_add_service_uuid16(0x1800);
+    att_db_util_add_characteristic_uuid16(
+        0x2A00, ATT_PROPERTY_READ,
+        ATT_SECURITY_NONE, ATT_SECURITY_NONE,
+        (uint8_t*)"PicoBLE", 7
+    );
+
+    // GATT: Service Changed
+    uint8_t svc_changed_val[4] = {0x00,0x00,0x00,0x00};
+    att_db_util_add_service_uuid16(0x1801);
+    att_db_util_add_characteristic_uuid16(
+        0x2A05, ATT_PROPERTY_INDICATE,
+        ATT_SECURITY_NONE, ATT_SECURITY_NONE,
+        svc_changed_val, sizeof(svc_changed_val)
+    );
+
+    // Custom service + characteristics
+    att_db_util_add_service_uuid128(UUID_SVC_19B1_0000);
+
+    // Notify (READ | NOTIFY) with 1-byte initial value
+    uint8_t init_notify_val[1] = {0x00};
+    notify_val_handle = att_db_util_add_characteristic_uuid128(
+        UUID_CHR_19B1_0001,
+        ATT_PROPERTY_READ | ATT_PROPERTY_NOTIFY,
+        ATT_SECURITY_NONE, ATT_SECURITY_NONE,
+        init_notify_val, sizeof(init_notify_val)
+    );
+
+    // In att_db_util, CCCD is allocated immediately after the value handle
+    notify_cccd_handle = (uint16_t)(notify_val_handle + 1);
+
+    // Write (WRITE w/ response) dynamic
+    write_val_handle = att_db_util_add_characteristic_uuid128(
+        UUID_CHR_19B1_0002,
+        ATT_PROPERTY_WRITE | ATT_PROPERTY_DYNAMIC,
+        ATT_SECURITY_NONE, ATT_SECURITY_NONE,
+        NULL, 0
+    );
+}
+
+int main(void){
     stdio_init_all();
-    printf("Starting BLE GATT Server for PicoBeacon compatibility...\n");
-    
-    // Initialize CYW43
-    if (cyw43_arch_init() != 0) {
-        printf("Failed to initialize CYW43\n");
+
+    // Optional: brief wait so early prints aren't lost
+    for (int i = 0; i < 100; ++i) sleep_ms(10);
+
+    printf("BLE: PicoBLE cmd peripheral (att_db_util)\n");
+
+    if (cyw43_arch_init() != 0){
+        printf("CYW43 init failed\n");
         return 1;
     }
-    
-    // Initialize BTstack
+    set_led(false); // OFF at start
+
     l2cap_init();
     sm_init();
-    
-    // Setup ATT server
-    att_server_init((uint8_t*)gatt_database, &att_read_callback, &att_write_callback);
-    
-    // Set the characteristic handles (these correspond to the GATT database)
-    notify_char_handle = 0x0006;  // Handle for notify characteristic value
-    write_char_handle = 0x0009;   // Handle for write characteristic value
-    
-    // Register for HCI events
-    hci_event_callback_registration.callback = &packet_handler;
-    hci_add_event_handler(&hci_event_callback_registration);
-    
-    // Register for ATT events
+
+    build_gatt();
+    printf("notify=0x%04x write=0x%04x cccd=0x%04x\n",
+           notify_val_handle, write_val_handle, notify_cccd_handle);
+
+    att_server_init(att_db_util_get_address(), &att_read_cb, &att_write_cb);
+
+    hci_event_cb.callback = &packet_handler;
+    hci_add_event_handler(&hci_event_cb);
     att_server_register_packet_handler(&packet_handler);
-    
-    // Turn on Bluetooth
+
     hci_power_control(HCI_POWER_ON);
-    
-    printf("GATT server ready. Waiting for connections...\n");
-    printf("Device will appear as 'PicoBeacon'\n");
-    printf("Supports commands: 'led on', 'led off', 'led?', and echo\n");
-    
-    // Main loop
-    while (true) {
-        btstack_run_loop_execute();
-        sleep_ms(10);
-    }
-    
+    btstack_run_loop_execute();
     return 0;
 }
