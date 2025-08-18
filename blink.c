@@ -1,11 +1,8 @@
 // BLE peripheral for Raspberry Pi Pico W using att_db_util
-// - Advertises custom 128-bit service UUID (in ADV) and name "PicoBLE" (in scan response)
-// - GATT includes GAP Device Name + GATT Service Changed + custom service
-// - Notify char: 19b10001-... (READ | NOTIFY, 1-byte init value)
-// - Write  char: 19b10002-... (WRITE w/ response, DYNAMIC)
-// - Commands: "led on", "led off", "led?" ; else echo "pico says: <...>"
-// - Sends <READY> only after CCCD enables notifications
-// - Uses ATT_EVENT_CAN_SEND_NOW + a tiny queue for reliable notifies
+// - Fixed 5 Hz streaming of current time since boot (ms) once notifications are enabled
+// - Commands: "led on", "led off", "led?" (responses via notify)
+// - Sends <READY>\n only after CCCD enables notifications
+// - Uses ATT_EVENT_CAN_SEND_NOW + tiny queue for reliable notifies
 
 #include <stdio.h>
 #include <string.h>
@@ -13,6 +10,7 @@
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
 #include "btstack.h"
+#include "btstack_run_loop.h"
 #include "att_db_util.h"
 
 static hci_con_handle_t connection_handle = HCI_CON_HANDLE_INVALID;
@@ -31,13 +29,34 @@ static uint16_t pending_len = 0;
 
 static void queue_note(const char *s){
     if (!s) return;
+    if (connection_handle == HCI_CON_HANDLE_INVALID || !notify_enabled) return;
+    if (pending_len) return; // drop if previous hasn't been sent yet (5 Hz won't backlog)
     size_t n = strlen(s);
     if (n > MSG_MAX) n = MSG_MAX;
     memcpy(pending_msg, s, n);
     pending_len = (uint16_t)n;
-    if (connection_handle != HCI_CON_HANDLE_INVALID){
-        att_server_request_can_send_now_event(connection_handle);
+    att_server_request_can_send_now_event(connection_handle);
+}
+
+static inline uint32_t now_ms(void){ return to_ms_since_boot(get_absolute_time()); }
+
+// --- fixed 5 Hz streaming (every ~200 ms) ---
+static btstack_timer_source_t stream_timer;
+
+static void restart_stream_timer(void){
+    if (!notify_enabled || connection_handle == HCI_CON_HANDLE_INVALID) return;
+    btstack_run_loop_set_timer(&stream_timer, 200);   // 5 Hz
+    btstack_run_loop_add_timer(&stream_timer);
+}
+
+static void stream_cb(btstack_timer_source_t *ts){
+    (void)ts;
+    if (notify_enabled && connection_handle != HCI_CON_HANDLE_INVALID){
+        char line[MSG_MAX];
+        snprintf(line, sizeof(line), "TIME=%.3f\n", now_ms() / 1000.0f);
+        queue_note(line);
     }
+    restart_stream_timer();
 }
 
 // UUIDs (little-endian bytes)
@@ -63,16 +82,15 @@ static void set_led(bool on){
 }
 
 static void send_led_status(void){
-    queue_note(led_on ? "LED=ON" : "LED=OFF");
+    queue_note(led_on ? "LED=ON\n" : "LED=OFF\n");
 }
 
 // --- ATT callbacks ---
 static uint16_t att_read_cb(hci_con_handle_t con_handle, uint16_t att_handle, uint16_t offset,
                             uint8_t *buffer, uint16_t buffer_size){
     (void)con_handle; (void)att_handle; (void)offset;
-    // keep a 1-byte readable value so CoreBluetooth is happy
     if (buffer && buffer_size){
-        buffer[0] = 0x00;
+        buffer[0] = 0x00;  // keep a 1-byte readable value
         return 1;
     }
     return 0;
@@ -85,7 +103,6 @@ static int att_write_cb(hci_con_handle_t con_handle, uint16_t att_handle, uint16
 
     // Client toggled notifications?
     if (att_handle == notify_cccd_handle){
-        // value is 2 bytes, bit0 = notifications enabled
         int en = 0;
         if (len >= 2){
             uint16_t v = data[0] | (data[1] << 8);
@@ -93,7 +110,8 @@ static int att_write_cb(hci_con_handle_t con_handle, uint16_t att_handle, uint16
         }
         notify_enabled = en;
         if (notify_enabled){
-            queue_note("<READY>");
+            queue_note("<READY>\n");
+            restart_stream_timer();    // start fixed 5 Hz stream
         } else {
             pending_len = 0;
         }
@@ -102,8 +120,9 @@ static int att_write_cb(hci_con_handle_t con_handle, uint16_t att_handle, uint16
 
     // Command written to our write characteristic?
     if (att_handle == write_val_handle){
+        if (len == 0 || len > 120){ queue_note("ERR\n"); return 0; }
+
         char cmd[128];
-        if (len >= (int)sizeof(cmd)) len = sizeof(cmd)-1;
         memcpy(cmd, data, len); cmd[len] = '\0';
 
         // trim
@@ -116,16 +135,16 @@ static int att_write_cb(hci_con_handle_t con_handle, uint16_t att_handle, uint16
         for (size_t i=0; i<L && i<sizeof(low)-1; ++i) low[i] = (char)tolower((unsigned char)p[i]);
 
         if (strcmp(low,"led on")==0){
-            set_led(true);  queue_note("OK");
+            set_led(true);  queue_note("OK\n");
         } else if (strcmp(low,"led off")==0){
-            set_led(false); queue_note("OK");
+            set_led(false); queue_note("OK\n");
         } else if (strcmp(low,"led?")==0 || strcmp(low,"led ?")==0){
             send_led_status();
         } else if (strcmp(low,"test")==0){
-            queue_note("OK");
+            queue_note("OK\n");
         } else {
             char out[MSG_MAX];
-            snprintf(out,sizeof(out),"pico says: %s", p);
+            snprintf(out,sizeof(out),"pico says: %s\n", p);
             queue_note(out);
         }
         return 0;
@@ -155,8 +174,9 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             if (sub == HCI_SUBEVENT_LE_CONNECTION_COMPLETE){
                 connection_handle = hci_subevent_le_connection_complete_get_connection_handle(packet);
                 printf("Connected (handle %04x)\n", connection_handle);
+                // 30–50 ms interval is fine for >=5 Hz notify
                 gap_request_connection_parameter_update(connection_handle, 24, 40, 0, 400);
-                // Don't send any notify yet; wait for CCCD enable -> <READY>
+                if (notify_enabled) restart_stream_timer();
             }
             break;
         }
@@ -228,11 +248,8 @@ static void build_gatt(void){
 
 int main(void){
     stdio_init_all();
-
-    // Optional: brief wait so early prints aren't lost
     for (int i = 0; i < 100; ++i) sleep_ms(10);
-
-    printf("BLE: PicoBLE cmd peripheral (att_db_util)\n");
+    printf("BLE: PicoBLE 5Hz time streamer (att_db_util)\n");
 
     if (cyw43_arch_init() != 0){
         printf("CYW43 init failed\n");
@@ -246,6 +263,9 @@ int main(void){
     build_gatt();
     printf("notify=0x%04x write=0x%04x cccd=0x%04x\n",
            notify_val_handle, write_val_handle, notify_cccd_handle);
+
+    // init stream timer
+    btstack_run_loop_set_timer_handler(&stream_timer, stream_cb);
 
     att_server_init(att_db_util_get_address(), &att_read_cb, &att_write_cb);
 
